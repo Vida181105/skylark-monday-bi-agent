@@ -13,6 +13,19 @@ GraphQL read of both boards (cached for 60 seconds).
 
 ---
 
+## Approach
+
+Three problems stacked, worked in that order.
+
+1. **Trustworthy data.** Both boards have known defects, so cleaning lives in one
+   module, written and tested first. No answer depends on which code path loaded
+   the data.
+2. **A model that can't invent numbers.** The model never sees a full table. It
+   gets two tools, and every figure in an answer is computed in pandas.
+3. **An honest interface.** Every tool result carries null coverage for the
+   columns that query touched, so caveats are computed per-question rather than
+   remembered.
+
 ## Architecture
 
 ```
@@ -168,15 +181,106 @@ pytest -q     # 50 tests, fully offline (monday.com is stubbed)
 - **Leadership summary** — one-click digest of pipeline health, sector movement,
   execution/collection risk, and the decisions needing attention.
 
-Assumptions it states rather than stalls on: fiscal year is **Indian FY,
-1 April – 31 March**; "pipeline" means `Deal Status = Open`.
+## Assumptions
 
-**On the data snapshot:** the boards' records stop around January 2026, and no
-open deal has a tentative close date in the future. Questions scoped to the
-current period therefore match nothing — the agent reports that honestly and
-offers the unscoped view, but the sample questions deliberately avoid
-"this quarter"/"this week" phrasing so the demo shows substantive answers. It asks a
-clarifying question only when the readings would give materially different
-answers.
+Where the brief was ambiguous, the agent picks a reading and states it in the
+answer rather than stalling.
+
+| Ambiguity | Assumption |
+|---|---|
+| "this quarter" | Indian FY, 1 Apr – 31 Mar. The prompt is given exact current-quarter bounds. |
+| "pipeline" | `Deal Status = Open`. Won/Dead excluded; On Hold only when stated. |
+| "energy sector" and similar | Mapped to the nearest `Sector/service` values, with the mapping named in the answer. |
+| Deal values | Masked but internally consistent. Sums and ratios hold; they are not real rupees. |
+| Which nulls matter | Late-lifecycle nulls are semantic. Only sparse core fields are caveated. |
+| Cross-board join | Numeric suffix of the customer code, left-outer. |
+| Write access | None. Read-only. |
+
+The boards' records stop around January 2026, so questions scoped to the current
+period match nothing. The agent says so and offers the unscoped view.
+
+## Trade-offs
+
+- **Streamlit as one process** rather than a FastAPI/React split: satisfies
+  "conversational" and "hosted with zero setup" from one repo. Costs multi-user
+  auth and UI polish.
+- **monday.com GraphQL directly, not the MCP server**: one process instead of
+  two, for capability the API covers in ~120 lines.
+- **Gemini Flash-Lite**: chosen by measurement, not preference. The free tier
+  limits *requests per day* and each tool round is one request, so full Flash
+  (20/day) allows about three questions for the whole app. `GEMINI_MODEL`
+  overrides it on a paid key.
+- **One general query tool, not a tool per canned question**: hardcoded tools
+  only answer questions anticipated in advance. The cost is that the model can
+  compose a subtly wrong query, so results carry row counts and null coverage.
+- **Aggregation in pandas, not in context**: answers cover all 342 deals and 176
+  work orders rather than whatever sample fits in a prompt.
+
+## AI tools used
+
+Built with Claude (Opus 5) in an agentic session. Concretely:
+
+- I profiled the live boards first and let the data drive the design — the defect
+  table above came out of that profiling pass, not from the brief, and the
+  normalisation layer was written against it rather than guessed at. Profiling is
+  what surfaced monday serving dates as JavaScript `Date.toString()` strings
+  (pandas silently turning every date column into `NaT`) and the 43 empty
+  work-order columns contaminating the Deals board.
+- Claude wrote the bulk of the implementation; I directed the architecture
+  (provider confined to one module, one general query tool instead of canned
+  per-question tools, aggregation in pandas rather than in the model's context,
+  null coverage returned with every result) and caught several bugs by checking
+  the agent's answers against the boards: a 48-row listing tallied by eye
+  reporting 255.6M against an actual 688.2M, a headline total added up from its
+  own grouped rows and 710k off, "this quarter" read off a calendar-quarter
+  label instead of the date and reporting 8 deals closing when the answer is
+  zero, an oldest-deal query returning one of the newest because the sort
+  default is descending, and a ranking that called a 50% sector a top converter
+  with 57.7% sitting above it in the same table.
+- Each fix was structural rather than another prompt instruction — row listings
+  warn against tallying, grouped results carry an engine-computed total, the
+  prompt is handed exact quarter bounds, responses echo the sort order applied.
+- Tests were written after the bugs, to pin the specific behaviours that had been
+  wrong.
+
+**Running it — Google Gemini via `google-genai`.** `gemini-3.5-flash-lite`,
+driving a hand-written tool-use loop (`automatic_function_calling` disabled). The
+model picks which board to query and how to filter and join. It never sees the
+raw boards and never computes a figure itself.
+
+Board access is the monday.com GraphQL API v2 directly. 
+
+## Challenges faced
+
+- **Dates arrived silently empty.** monday serves JavaScript `Date.toString()`
+  values, which pandas converted to `NaT` without raising. Every date column
+  looked 100% null and every time-scoped question would have returned zero while
+  appearing to work.
+- **The Deals board carried an empty copy of the work-order schema** — 43 dead
+  columns, including a blank `Sector` beside the real `Sector/service`.
+- **The model fabricated arithmetic three times**: tallying a 48-row listing by
+  eye, adding up its own grouped rows for a headline, and mapping a
+  calendar-quarter label onto "this quarter" without checking the date. Each was
+  fixed structurally rather than with another instruction — row listings warn
+  against tallying, grouped results carry an engine-computed total, and the
+  prompt is handed exact quarter bounds.
+- **A sort default inverted an answer.** `ascending` defaults to false, right for
+  "largest" and backwards for "oldest". Responses now echo the order applied.
+- **Free-tier quota shaped the design**: payload capping, retry on 429 and 5xx,
+  and a forced final answer when the tool-round budget runs out instead of
+  returning nothing.
+
+## Potential improvements
+
+- **Caching and request budget** — context caching on the stable prefix, a longer
+  board TTL, and trimming old tool results from history.
+- **A provider fallback** — a paid tier or a second free provider such as Groq,
+  since the daily cap can surface as rate-limit errors under real usage.
+- **An evaluation set** — ~20 questions with hand-checked answers as a regression
+  suite. The manual spot-checks found errors the unit tests could not.
+- **Charts** for trend and funnel questions.
+- **Confirm the sector taxonomy** with the business; the energy mapping is
+  inferred.
+- **Scoped write-back** and **per-user monday tokens**.
 
 See [`DECISION_LOG.md`](DECISION_LOG.md) for the trade-offs behind these choices.
